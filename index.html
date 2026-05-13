@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>배터리 1D 모델링: FDM vs LSTM vs PINN</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background-color: #f4f7f6; color: #333; }
+        .container { max-width: 700px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h2 { text-align: center; color: #2c3e50; font-size: 1.4rem; margin-bottom: 5px; }
+        p.subtitle { text-align: center; color: #7f8c8d; font-size: 0.9rem; margin-top: 0; margin-bottom: 20px; }
+        .controls { margin-top: 20px; padding: 15px; background: #eef2f3; border-radius: 8px; }
+        .button-group { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 15px; }
+        button { flex: 1 1 calc(50% - 10px); padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: white; transition: 0.3s; font-size: 0.95rem; }
+        #btn-fdm { background-color: #3498db; } #btn-fdm:hover { background-color: #2980b9; }
+        #btn-lstm { background-color: #e67e22; } #btn-lstm:hover { background-color: #d35400; }
+        #btn-pinn { background-color: #27ae60; } #btn-pinn:hover { background-color: #2ecc71; }
+        #btn-reset { background-color: #95a5a6; } #btn-reset:hover { background-color: #7f8c8d; }
+        .status-board { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 0.95rem; line-height: 1.5; }
+        .highlight { color: #f1c40f; font-weight: bold; }
+        .alert { color: #e74c3c; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>차세대 BMS 알고리즘 시각화</h2>
+    <p class="subtitle">배터리 내부 리튬 이온 확산(1D) 모델링 한계점 비교</p>
+    
+    <canvas id="compareChart" width="400" height="250"></canvas>
+    
+    <div class="controls">
+        <div class="button-group">
+            <button id="btn-fdm">1. FDM </button>
+            <button id="btn-lstm">2. LSTM </button>
+            <button id="btn-pinn">3. PINN </button>
+            <button id="btn-reset">초기화</button>
+        </div>
+
+        <div class="status-board" id="statusBoard">
+            ▶ 시뮬레이션 대기 중... 버튼을 클릭하여 모델을 확인하세요.<br>
+            <span style="color:#7f8c8d;">[비교 검증 모드 활성화 됨]</span>
+        </div>
+    </div>
+</div>
+
+<script>
+    const N = 50; 
+    const dx = 1.0 / (N - 1);
+    const labels = Array.from({length: N}, (_, i) => (i * dx).toFixed(2));
+    
+    // 물리적 정답 커브 (FDM) : 매끄러운 2차 함수 형태의 확산 구배
+    const curveFDM = labels.map(x => 1.0 - 0.5 * Math.pow(x, 2));
+    
+    // LSTM 예측 커브 : 센서 노이즈에 과적합되어 물리법칙(확산)을 무시하고 요동치는 형태
+    const curveLSTM = labels.map((x, i) => 1.0 - 0.5 * Math.pow(x, 2) + 0.08 * Math.sin(i * 1.5));
+    
+    let curvePINN = new Array(N).fill(1.0); // PINN 초기값 (학습 전 엉뚱한 값)
+    let animationId = null;
+    let epoch = 0;
+    let isPinnTraining = false;
+
+    // Chart.js 세팅
+    const ctx = document.getElementById('compareChart').getContext('2d');
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                { label: 'FDM', data: new Array(N).fill(null), borderColor: '#3498db', borderWidth: 4, pointRadius: 0, tension: 0.4 },
+                { label: 'LSTM', data: new Array(N).fill(null), borderColor: '#e67e22', borderDash: [5, 5], borderWidth: 3, pointRadius: 0, tension: 0.4 },
+                { label: 'PINN', data: new Array(N).fill(null), borderColor: '#27ae60', borderWidth: 3, pointRadius: 0, tension: 0.4 }
+            ]
+        },
+        options: {
+            scales: {
+                y: { min: 0.2, max: 1.2, title: { display: true, text: '리튬 이온 농도 c(x,t)' } },
+                x: { title: { display: true, text: '입자 내부 위치 x (0: 중심 ~ 1: 표면)' } }
+            },
+            animation: false
+        }
+    });
+
+    const statusBoard = document.getElementById('statusBoard');
+
+    // 1. FDM 버튼 이벤트
+    document.getElementById('btn-fdm').addEventListener('click', () => {
+        chart.data.datasets[0].data = [...curveFDM];
+        chart.update();
+        statusBoard.innerHTML = `[FDM 도출 완료]<br>방정식에 따른 완벽한 확산 구배.<br>단점: <span class="alert">연산량이 많아 차량용 칩셋(MCU) 탑재 어려움</span>`;
+    });
+
+    // 2. LSTM 버튼 이벤트
+    document.getElementById('btn-lstm').addEventListener('click', () => {
+        chart.data.datasets[0].data = [...curveFDM]; // 비교를 위해 FDM 띄움
+        chart.data.datasets[1].data = [...curveLSTM];
+        chart.update();
+        statusBoard.innerHTML = `[LSTM 예측 완료] 속도: 매우 빠름<br>한계점: 센서 노이즈까지 암기하여 선이 요동침.<br><span class="alert">치명적 물리 모순 발생 (확산 법칙 위배)</span>`;
+    });
+
+    // 3. PINN 애니메이션 구동 함수
+    function trainPINN() {
+        if (!isPinnTraining || epoch >= 3000) {
+            isPinnTraining = false;
+            return;
+        }
+        epoch += 15;
+        let pdeLoss = 0;
+
+        for (let i = 0; i < N; i++) {
+            const diff = curveFDM[i] - curvePINN[i];
+            curvePINN[i] += diff * 0.03; // 에포크마다 정답에 서서히 근접
+            pdeLoss += Math.pow(diff, 2);
+        }
+        
+        chart.data.datasets[2].data = [...curvePINN];
+        chart.update();
+        
+        statusBoard.innerHTML = `[PINN 학습 중] 연산 속도: 빠름<br>Epoch: ${epoch} / 3000<br>Loss_Physics (물리 위배 오차): <span class="highlight">${(pdeLoss/N).toFixed(5)}</span><br>결과: 물리 방정식에 스스로 완벽히 수렴 중!`;
+
+        animationId = requestAnimationFrame(trainPINN);
+    }
+
+    document.getElementById('btn-pinn').addEventListener('click', () => {
+        chart.data.datasets[0].data = [...curveFDM]; // 비교를 위해 FDM 띄움
+        chart.data.datasets[1].data = new Array(N).fill(null); // LSTM 숨김
+        curvePINN = new Array(N).fill(1.0); // PINN 선 초기화
+        
+        if (!isPinnTraining) {
+            isPinnTraining = true;
+            epoch = 0;
+            trainPINN();
+        }
+    });
+
+    // 초기화 버튼 이벤트
+    document.getElementById('btn-reset').addEventListener('click', () => {
+        isPinnTraining = false;
+        cancelAnimationFrame(animationId);
+        chart.data.datasets.forEach(ds => ds.data = new Array(N).fill(null));
+        chart.update();
+        statusBoard.innerHTML = `▶ 시뮬레이션 대기 중... 버튼을 클릭하여 모델을 확인하세요.<br><span style="color:#7f8c8d;">[비교 검증 모드 활성화 됨]</span>`;
+    });
+</script>
+
+</body>
+</html>
